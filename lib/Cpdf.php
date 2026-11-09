@@ -253,7 +253,7 @@ class Cpdf
      * @var integer The version of the font metrics cache file.
      * This value must be manually incremented whenever the internal font data structure is modified.
      */
-    public $fontcacheVersion = 6;
+    public $fontcacheVersion = 7;
 
     /**
      * @var string Temporary folder.
@@ -1000,7 +1000,7 @@ class Cpdf
                     // transform FPDF to TCPDF (http://tcpdf.sourceforge.net/)
 
                     $toUnicodeId = ++$this->numObj;
-                    $this->o_toUnicode($toUnicodeId, 'new');
+                    $this->o_toUnicode($toUnicodeId, 'new', ['fontFileName' => $options['fontFileName']]);
                     $this->objects[$id]['info']['toUnicode'] = $toUnicodeId;
 
                     $cidFontId = ++$this->numObj;
@@ -1160,6 +1160,11 @@ class Cpdf
             $cid_widths = [];
 
             foreach ($font['C'] as $num => $d) {
+                if ($font['isUnicode'] && intval($num) > 0xFFFF) {
+                    // Supplementary characters are mapped to CIDs dynamically, see getCid()
+                    continue;
+                }
+
                 if (intval($num) > 0 || $num == '0') {
                     if (!$font['isUnicode']) {
                         // With Unicode, widths array isn't used
@@ -1245,6 +1250,9 @@ class Cpdf
             // load the pfb file, and put that into an object too.
             // note that pdf supports only binary format type 1 font files, though there is a
             // simple utility to convert them from pfa to pfb.
+            // The glyph IDs of the embedded subset, null if the complete font is embedded
+            $subsetGids = null;
+
             if (!$font['isSubsetting']) {
                 $data = file_get_contents($fbfile);
             } else {
@@ -1259,8 +1267,9 @@ class Cpdf
                 $font_obj->parse();
 
                 // Define subset
-                $font_obj->setSubset($subset);
+                $this->setFontSubset($font_obj, $font, $subset);
                 $font_obj->reduce();
+                $subsetGids = $font_obj->getSubset();
 
                 // Write new font
                 $tmp_name = @tempnam($this->tmp, "cpdf_subset_");
@@ -1304,10 +1313,15 @@ class Cpdf
                     $data = file_get_contents($tmp_name);
                 } else {
                     $data = file_get_contents($fbfile);
+                    $subsetGids = null;
                 }
 
                 $font_obj->close();
                 unlink($tmp_name);
+            }
+
+            if ($font['isUnicode']) {
+                $this->addNonBmpCids($font, $subsetGids);
             }
 
             // create the font descriptor
@@ -1404,18 +1418,134 @@ class Cpdf
     }
 
     /**
+     * Define the glyph subset of a font, including the glyphs of characters
+     * outside the Basic Multilingual Plane.
+     *
+     * php-font-lib only considers the first Unicode cmap subtable when
+     * determining the glyphs of a subset, which usually is the BMP-only format 4
+     * subtable. The glyphs of supplementary characters are temporarily added to
+     * that subtable, so that they are included in the subset. The subtable is
+     * restored afterwards, so that the cmap of the subset font stays valid.
+     *
+     * @param \FontLib\TrueType\File $font_obj
+     * @param array                  $font     The font data
+     * @param int[]                  $subset   The code points to include
+     */
+    private function setFontSubset($font_obj, array $font, array $subset): void
+    {
+        $nonBmpGids = [];
+        foreach ($subset as $c) {
+            if ($c > 0xFFFF && isset($font['nonBmpGids'][$c])) {
+                $nonBmpGids[$c] = $font['nonBmpGids'][$c];
+            }
+        }
+
+        $cmap = $nonBmpGids ? $font_obj->getTableObject("cmap") : null;
+        $index = null;
+        if ($cmap && isset($cmap->data["subtables"])) {
+            foreach ($cmap->data["subtables"] as $i => $_subtable) {
+                if ($_subtable["platformID"] == 0 || ($_subtable["platformID"] == 3 && $_subtable["platformSpecificID"] == 1)) {
+                    $index = $i;
+                    break;
+                }
+            }
+        }
+
+        if ($index === null) {
+            $font_obj->setSubset($subset);
+            return;
+        }
+
+        $original = $cmap->data["subtables"][$index]["glyphIndexArray"];
+        $cmap->data["subtables"][$index]["glyphIndexArray"] = $original + $nonBmpGids;
+
+        try {
+            $font_obj->setSubset($subset);
+        } finally {
+            $cmap->data["subtables"][$index]["glyphIndexArray"] = $original;
+        }
+    }
+
+    /**
+     * Add the CIDs assigned to characters outside the Basic Multilingual Plane
+     * to the CID to GID map and the CID widths of a font.
+     *
+     * @param array      $font       The font data
+     * @param array|null $subsetGids The (original) glyph IDs of the embedded subset,
+     *                               indexed by their new glyph ID; null if the
+     *                               complete font is embedded
+     */
+    private function addNonBmpCids(array &$font, ?array $subsetGids): void
+    {
+        if (empty($font['nonBmpCids'])) {
+            return;
+        }
+
+        $compressed = !empty($font['CIDtoGID_Compressed']);
+        $cidtogid = base64_decode($font['CIDtoGID']);
+        if ($compressed) {
+            $cidtogid = gzuncompress($cidtogid);
+        }
+
+        foreach ($font['nonBmpCids'] as $c => $cid) {
+            $gid = $font['nonBmpGids'][$c] ?? 0;
+            if ($gid && $subsetGids !== null) {
+                $gid = array_search($gid, $subsetGids);
+                if ($gid === false) {
+                    $gid = 0;
+                }
+            }
+
+            $length = ($cid + 1) * 2;
+            if (strlen($cidtogid) < $length) {
+                $cidtogid = str_pad($cidtogid, $length, "\x00");
+            }
+            $cidtogid[$cid * 2] = chr($gid >> 8);
+            $cidtogid[$cid * 2 + 1] = chr($gid & 0xFF);
+
+            $font['CIDWidths'][$cid] = $this->getCharWidth($font, $c);
+        }
+
+        if ($compressed) {
+            $cidtogid = gzcompress($cidtogid);
+        }
+        $font['CIDtoGID'] = base64_encode($cidtogid);
+    }
+
+    /**
+     * Get the width of a character in glyph space units (1/1000 of the font size).
+     *
+     * @param array $font The font data
+     * @param int   $c    The code point of the character
+     * @return float
+     */
+    private function getCharWidth(array $font, int $c): float
+    {
+        if (isset($font['C'][$c])) {
+            return $font['C'][$c];
+        } elseif (isset($font['C'][0xFFFD])) {
+            // fffd => replacement character
+            return $font['C'][0xFFFD];
+        }
+
+        return $font['C'][0x0020] ?? 0;
+    }
+
+    /**
      * A toUnicode section, needed for unicode fonts
      *
      * @param $id
      * @param $action
+     * @param array $options
      * @return null|string
      */
-    protected function o_toUnicode($id, $action)
+    protected function o_toUnicode($id, $action, $options = [])
     {
         switch ($action) {
             case 'new':
                 $this->objects[$id] = [
-                    't'    => 'toUnicode'
+                    't'    => 'toUnicode',
+                    'info' => $options
                 ];
                 break;
             case 'add':
@@ -1428,6 +1558,27 @@ class Cpdf
                     $this->encryptInit($id);
                     $ordering = $this->filterText($this->ARC4($ordering), false, false);
                     $registry = $this->filterText($this->ARC4($registry), false, false);
+                }
+
+                // CIDs of BMP characters are identical to their code point.
+                // Characters outside the BMP are mapped to CIDs in the surrogate
+                // range, see getCid()
+                $fontFileName = $this->objects[$id]['info']['fontFileName'] ?? null;
+                $nonBmpCids = $fontFileName !== null ? ($this->fonts[$fontFileName]['nonBmpCids'] ?? []) : [];
+
+                if (empty($nonBmpCids)) {
+                    $mappings = "1 beginbfrange\n<0000> <FFFF> <0000>\nendbfrange";
+                } else {
+                    $mappings = "2 beginbfrange\n<0000> <D7FF> <0000>\n<E000> <FFFF> <E000>\nendbfrange";
+
+                    // At most 100 entries are allowed per bfchar block
+                    foreach (array_chunk($nonBmpCids, 100, true) as $chunk) {
+                        $mappings .= "\n" . count($chunk) . " beginbfchar";
+                        foreach ($chunk as $c => $cid) {
+                            $mappings .= sprintf("\n<%04X> <%s>", $cid, strtoupper(bin2hex($this->codePointToUtf16BE($c))));
+                        }
+                        $mappings .= "\nendbfchar";
+                    }
                 }
 
                 $stream = <<<EOT
@@ -1444,9 +1595,7 @@ begincmap
 1 begincodespacerange
 <0000> <FFFF>
 endcodespacerange
-1 beginbfrange
-<0000> <FFFF> <0000>
-endbfrange
+$mappings
 endcmap
 CMapName currentdict /CMap defineresource pop
 end
@@ -3766,6 +3915,10 @@ EOT;
                                 if ($c >= 0 && $c < 0xFFFF && $glyph) {
                                     $cidtogid[$c * 2] = chr($glyph >> 8);
                                     $cidtogid[$c * 2 + 1] = chr($glyph & 0xFF);
+                                } elseif ($c > 0xFFFF && $glyph) {
+                                    // Code points outside the BMP do not fit into the 2-byte
+                                    // CID space, remember their glyph for dynamic CID assignment
+                                    $data['nonBmpGids'][$c] = $glyph;
                                 }
 
                                 if (!ctype_xdigit($n) || $c != hexdec($n)) {
@@ -3798,6 +3951,11 @@ EOT;
                 $cidtogid = gzcompress($cidtogid, 6);
             }
             $data['CIDtoGID'] = base64_encode($cidtogid);
+
+            if ($data['isUnicode']) {
+                $this->loadNonBmpMetrics($font, $data);
+            }
+
             $data['_version_'] = $this->fontcacheVersion;
             $this->fonts[$font] = $data;
 
@@ -3811,6 +3969,69 @@ EOT;
 
         if (!isset($this->fonts[$font])) {
             $this->addMessage("openFont: no font file found for $font.");
+        }
+    }
+
+    /**
+     * Add metrics for characters outside the Basic Multilingual Plane
+     * (code points above U+FFFF) to the font data.
+     *
+     * UFM files generated by php-font-lib usually only contain the characters
+     * of the (BMP-only) format 4 cmap subtable. If the TrueType font file is
+     * available, its format 12 cmap subtable is used to determine the glyphs
+     * and widths of the supplementary characters.
+     *
+     * @param string $font Path of the font, without file extension
+     * @param array  $data The font data to amend
+     */
+    private function loadNonBmpMetrics(string $font, array &$data): void
+    {
+        if (file_exists("$font.ttf")) {
+            $fontFile = "$font.ttf";
+        } elseif (file_exists("$font.TTF")) {
+            $fontFile = "$font.TTF";
+        } else {
+            return;
+        }
+
+        try {
+            $font_obj = Font::load($fontFile);
+            if (!$font_obj) {
+                return;
+            }
+
+            $subtables = $font_obj->getData("cmap", "subtables") ?? [];
+            $glyphIndexArray = null;
+            foreach ($subtables as $subtable) {
+                if ($subtable["format"] == 12
+                    && ($subtable["platformID"] == 0 || ($subtable["platformID"] == 3 && $subtable["platformSpecificID"] == 10))
+                ) {
+                    $glyphIndexArray = $subtable["glyphIndexArray"];
+                    break;
+                }
+            }
+
+            if ($glyphIndexArray) {
+                $hmtx = null;
+                foreach ($glyphIndexArray as $c => $gid) {
+                    if ($c <= 0xFFFF || $c > 0x10FFFF || !$gid || isset($data['nonBmpGids'][$c])) {
+                        continue;
+                    }
+
+                    if ($hmtx === null) {
+                        $hmtx = $font_obj->getData("hmtx");
+                    }
+
+                    $data['nonBmpGids'][$c] = $gid;
+                    if (!isset($data['C'][$c])) {
+                        $data['C'][$c] = $font_obj->normalizeFUnit(isset($hmtx[$gid]) ? $hmtx[$gid][0] : $hmtx[0][0]);
+                    }
+                }
+            }
+
+            $font_obj->close();
+        } catch (\Throwable $e) {
+            $this->addMessage("openFont: could not read supplementary characters from $fontFile: " . $e->getMessage());
         }
     }
 
@@ -5195,7 +5416,7 @@ EOT;
         if ($convert_encoding) {
             $cf = $this->currentFont;
             if (isset($this->fonts[$cf]) && $this->fonts[$cf]['isUnicode']) {
-                $text = $this->utf8toUtf16BE($text, $bom);
+                $text = ($bom ? "\xFE\xFF" : '') . $this->utf8toCidString($text);
             } else {
                 //$text = html_entity_decode($text, ENT_QUOTES);
                 $text = mb_convert_encoding($text, self::$targetEncoding, 'UTF-8');
@@ -5254,7 +5475,7 @@ EOT;
                     for ($j = 1; $j < $numbytes; $j++) {
                         $c += ($bytes[$j] << (($numbytes - $j - 1) * 0x06));
                     }
-                    if ((($c >= 0xD800) and ($c <= 0xDFFF)) or ($c >= 0x10FFFF)) {
+                    if ((($c >= 0xD800) and ($c <= 0xDFFF)) or ($c > 0x10FFFF)) {
                         // The definition of UTF-8 prohibits encoding character numbers between
                         // U+D800 and U+DFFF, which are reserved for use with the UTF-16
                         // encoding form (as surrogate pairs) and do not directly represent
@@ -5295,16 +5516,79 @@ EOT;
 
         $unicode = $this->utf8toCodePointsArray($text);
         foreach ($unicode as $c) {
-            if ($c === 0xFFFD) {
-                $out .= "\xFF\xFD"; // replacement character
-            } elseif ($c < 0x10000) {
-                $out .= chr($c >> 0x08) . chr($c & 0xFF);
-            } else {
-                $c -= 0x10000;
-                $w1 = 0xD800 | ($c >> 0x10);
-                $w2 = 0xDC00 | ($c & 0x3FF);
-                $out .= chr($w1 >> 0x08) . chr($w1 & 0xFF) . chr($w2 >> 0x08) . chr($w2 & 0xFF);
-            }
+            $out .= $this->codePointToUtf16BE($c);
+        }
+
+        return $out;
+    }
+
+    /**
+     * convert a single code point to UTF-16BE, using a surrogate pair for
+     * characters outside the Basic Multilingual Plane
+     *
+     * @param int $c
+     * @return string
+     */
+    private function codePointToUtf16BE(int $c): string
+    {
+        if ($c < 0x10000) {
+            return chr($c >> 0x08) . chr($c & 0xFF);
+        }
+
+        $c -= 0x10000;
+        $w1 = 0xD800 | ($c >> 10);
+        $w2 = 0xDC00 | ($c & 0x3FF);
+        return chr($w1 >> 0x08) . chr($w1 & 0xFF) . chr($w2 >> 0x08) . chr($w2 & 0xFF);
+    }
+
+    /**
+     * Get the CID used to show a character with a Unicode font.
+     *
+     * Unicode fonts are embedded as CID fonts with the 2-byte Identity-H
+     * encoding, so CIDs are limited to the range 0x0000-0xFFFF. Characters of
+     * the Basic Multilingual Plane use their code point as CID. Characters
+     * outside of it are assigned a CID from the surrogate range
+     * (0xD800-0xDFFF) on first use, as these code points are never used for
+     * actual characters. The assigned CIDs are mapped to the right glyphs in
+     * the CIDToGIDMap and back to Unicode in the ToUnicode CMap of the font.
+     *
+     * @param string $font The font file name
+     * @param int    $c    The code point of the character
+     * @return int
+     */
+    protected function getCid(string $font, int $c): int
+    {
+        if ($c <= 0xFFFF) {
+            return $c;
+        }
+
+        if (isset($this->fonts[$font]['nonBmpCids'][$c])) {
+            return $this->fonts[$font]['nonBmpCids'][$c];
+        }
+
+        $cid = 0xD800 + count($this->fonts[$font]['nonBmpCids'] ?? []);
+        if ($cid > 0xDFFF) {
+            $this->addMessage("getCid: too many supplementary characters for font $font, using replacement character");
+            return 0xFFFD;
+        }
+
+        $this->fonts[$font]['nonBmpCids'][$c] = $cid;
+        return $cid;
+    }
+
+    /**
+     * Convert a UTF-8 string to a string of 2-byte CIDs for the current
+     * (Unicode) font.
+     *
+     * @param string $text UTF-8 string to process
+     * @return string
+     */
+    protected function utf8toCidString(string $text): string
+    {
+        $out = '';
+        foreach ($this->utf8toCodePointsArray($text) as $c) {
+            $cid = $this->getCid($this->currentFont, $c);
+            $out .= chr($cid >> 0x08) . chr($cid & 0xFF);
         }
 
         return $out;
@@ -5451,11 +5735,21 @@ EOT;
 
         if (strlen($text) > 0) {
             $part = $text;
-            $place_text = $this->filterText($part, false);
-            // modify unicode text so that extra word spacing is manually implemented (bug #)
             if ($this->fonts[$this->currentFont]['isUnicode'] && $wordSpaceAdjust != 0) {
+                // modify unicode text so that extra word spacing is manually implemented (bug #),
+                // as the Tw operator only applies to the single-byte code 32.
+                // Split at the spaces first, so that the adjustment is only
+                // inserted at character boundaries
                 $space_scale = 1000 / $size;
-                $place_text = str_replace("\x00\x20", "\x00\x20)\x00\x20" . (-round($space_scale * $wordSpaceAdjust)) . "\x00\x20(", $place_text);
+                $adjust = "\x00\x20)\x00\x20" . (-round($space_scale * $wordSpaceAdjust)) . "\x00\x20(";
+                $place_text = implode(
+                    $adjust,
+                    array_map(function ($p) {
+                        return $this->filterText($p, false);
+                    }, explode(' ', $part))
+                );
+            } else {
+                $place_text = $this->filterText($part, false);
             }
             $this->addContent(" /F$this->currentFontNum " . sprintf('%.1F Tf ', $size));
             $this->addContent(" [($place_text)] TJ");
