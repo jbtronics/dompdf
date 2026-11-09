@@ -241,4 +241,82 @@ class CPDFTest extends TestCase
 
         $this->assertSame($data, $canvas->get_cpdf()->getXmpMetadata());
     }
+
+    public function testUtf8toUtf16BESupplementaryCharacters(): void
+    {
+        $dompdf = new Dompdf();
+        $canvas = new CPDF([0, 0, 200, 200], "portrait", $dompdf);
+        $cpdf = $canvas->get_cpdf();
+
+        $text = "A\u{1F600}\u{10FFFF}";
+        $this->assertSame([0x41, 0x1F600, 0x10FFFF], $cpdf->utf8toCodePointsArray($text));
+        $this->assertSame("\x00\x41\xD8\x3D\xDE\x00\xDB\xFF\xDF\xFF", $cpdf->utf8toUtf16BE($text, false));
+    }
+
+    public static function supplementaryCharactersProvider(): array
+    {
+        return [
+            "with subsetting" => [true],
+            "without subsetting" => [false],
+        ];
+    }
+
+    /**
+     * @dataProvider supplementaryCharactersProvider
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('supplementaryCharactersProvider')]
+    public function testSupplementaryCharacters(bool $subsetting): void
+    {
+        $dompdf = new Dompdf();
+        $dompdf->getOptions()->setIsFontSubsettingEnabled($subsetting);
+        $canvas = new CPDF([0, 0, 200, 200], "portrait", $dompdf);
+        $canvas->new_page();
+
+        $font = $dompdf->getFontMetrics()->getFont("DejaVu Sans");
+        // U+1F600 and U+1F603 are part of DejaVu Sans, U+1D400 is not
+        $text = "a \u{1F600} b \u{1F603}\u{1D400}\u{1F600}";
+        $canvas->text(10, 10, $text, $font, 12, [0, 0, 0], 2.0);
+
+        // Supplementary characters must have the width of their glyph
+        $this->assertGreaterThan(
+            $canvas->get_text_width("a b ", $font, 12),
+            $canvas->get_text_width("a \u{1F600} b ", $font, 12)
+        );
+
+        $output = $canvas->get_cpdf()->output(true);
+
+        // Text is encoded using CIDs from the surrogate range, in order of first use
+        $this->assertStringContainsString(
+            "(\x00a\x00 )\x00 -167\x00 (\xD8\x00\x00 )\x00 -167\x00 (\x00b\x00 )\x00 -167\x00 (\xD8\x01\xD8\x02\xD8\x00)",
+            $output
+        );
+
+        // ToUnicode CMap maps the CIDs back to the characters
+        $this->assertStringContainsString("<0000> <D7FF> <0000>\n<E000> <FFFF> <E000>", $output);
+        $this->assertStringContainsString(
+            "3 beginbfchar\n<D800> <D83DDE00>\n<D801> <D83DDE03>\n<D802> <D835DC00>\nendbfchar",
+            $output
+        );
+
+        // Widths of the CIDs
+        $this->assertMatchesRegularExpression('/\/W \[.*\b55296 \[[1-9]/', $output);
+        $this->assertMatchesRegularExpression('/\/W \[.*\b55297 \[[1-9]/', $output);
+
+        // Glyphs of the CIDs in the CIDToGIDMap
+        $this->assertSame(1, preg_match('/\/CIDToGIDMap (\d+) 0 R/', $output, $matches));
+        $this->assertSame(1, preg_match("/\n{$matches[1]} 0 obj\n<<(.*?)>>\nstream\n(.*?)\nendstream/s", $output, $map));
+        $cidtogid = strpos($map[1], "/FlateDecode") !== false ? gzuncompress($map[2]) : $map[2];
+        $gid = function (int $cid) use ($cidtogid): int {
+            return (ord($cidtogid[$cid * 2]) << 8) | ord($cidtogid[$cid * 2 + 1]);
+        };
+        $this->assertNotSame(0, $gid(0xD800));
+        $this->assertNotSame(0, $gid(0xD801));
+        $this->assertNotSame($gid(0xD800), $gid(0xD801));
+        $this->assertSame(0, $gid(0xD802));
+        if (!$subsetting) {
+            // Glyph IDs of the original font
+            $this->assertSame(5857, $gid(0xD800));
+            $this->assertSame(5860, $gid(0xD801));
+        }
+    }
 }
